@@ -136,7 +136,19 @@ impl MemoryMappedFile {
     }
 
     pub fn atomic_buffer(&self, offset: Index, size: Index) -> AtomicBuffer {
+        self.bounds_check(offset, size);
         unsafe { AtomicBuffer::new(self.ptr.offset(offset as isize), size) }
+    }
+
+    #[inline]
+    fn bounds_check(&self, offset: Index, size: Index) {
+        assert!(
+            offset >= 0 && size >= 0 && offset.saturating_add(size) <= self.memory_size,
+            "MemoryMappedFile bounds check failed: offset={}, size={}, memory_size={}",
+            offset,
+            size,
+            self.memory_size
+        );
     }
 }
 
@@ -210,5 +222,50 @@ mod tests {
             let option = *b.get(n).unwrap();
             assert_eq!(option, (n & 0xff) as u8)
         }
+    }
+
+    #[test]
+    fn test_atomic_buffer_within_bounds() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let file_path = tmp_dir.path().join("bounds_test.file");
+        let file = MemoryMappedFile::create_new(file_path, 0, 128).unwrap();
+
+        // This should succeed - within bounds
+        let _buffer = file.atomic_buffer(0, 64);
+        let _buffer = file.atomic_buffer(64, 64);
+        let _buffer = file.atomic_buffer(0, 128);
+    }
+
+    #[test]
+    #[should_panic(expected = "bounds check failed")]
+    fn test_atomic_buffer_offset_out_of_bounds() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let file_path = tmp_dir.path().join("bounds_test.file");
+        let file = MemoryMappedFile::create_new(file_path, 0, 128).unwrap();
+
+        // This should panic - offset way beyond file size
+        let _buffer = file.atomic_buffer(1_000_000, 100);
+    }
+
+    #[test]
+    #[should_panic(expected = "bounds check failed")]
+    fn test_atomic_buffer_size_out_of_bounds() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let file_path = tmp_dir.path().join("bounds_test.file");
+        let file = MemoryMappedFile::create_new(file_path, 0, 128).unwrap();
+
+        // This should panic - size exceeds file size
+        let _buffer = file.atomic_buffer(0, 256);
+    }
+
+    #[test]
+    #[should_panic(expected = "bounds check failed")]
+    fn test_atomic_buffer_offset_plus_size_overflow() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let file_path = tmp_dir.path().join("bounds_test.file");
+        let file = MemoryMappedFile::create_new(file_path, 0, 128).unwrap();
+
+        // This should panic - offset + size exceeds file size
+        let _buffer = file.atomic_buffer(100, 100);
     }
 }

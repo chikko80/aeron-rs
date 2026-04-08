@@ -17,11 +17,17 @@
 use std::alloc::{alloc_zeroed, dealloc, Layout};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use cache_line_size::CACHE_LINE_SIZE;
-
 use crate::utils::types::{Index, Moment};
 
-pub const CACHE_LINE_LENGTH: Index = CACHE_LINE_SIZE as Index;
+/// Cache line length used for padding and alignment in Aeron protocol structures.
+///
+/// This is set to 64 bytes to match the Aeron protocol specification and ensure
+/// compatibility with the Aeron media driver. While some architectures (like ARM64)
+/// may have 128-byte cache lines, the protocol requires 64-byte alignment for
+/// interoperability.
+///
+/// See: https://github.com/UnitedTraders/aeron-rs/issues/29
+pub const CACHE_LINE_LENGTH: Index = 64;
 
 #[inline]
 /// Get system time since start of UNIX epoch in milliseconds (ms) (10^-3 sec)
@@ -71,15 +77,15 @@ pub fn semantic_version_to_string(version: i32) -> String {
     )
 }
 
-/// Allocate a buffer aligned on the cache size
+/// Allocate a buffer aligned on the cache line size
 pub fn alloc_buffer_aligned(size: Index) -> *mut u8 {
     unsafe {
-        let layout = Layout::from_size_align_unchecked(size as usize, CACHE_LINE_SIZE);
+        let layout = Layout::from_size_align_unchecked(size as usize, CACHE_LINE_LENGTH as usize);
         alloc_zeroed(layout)
     }
 }
 
-/// Deallocate a buffer aligned on a cache size
+/// Deallocate a buffer aligned on a cache line size
 pub unsafe fn dealloc_buffer_aligned(buff_ptr: *mut u8, len: Index) {
     if cfg!(debug_assertions) {
         // dealloc markers for debug
@@ -88,7 +94,7 @@ pub unsafe fn dealloc_buffer_aligned(buff_ptr: *mut u8, len: Index) {
         }
     }
 
-    let layout = Layout::from_size_align_unchecked(len as usize, CACHE_LINE_SIZE);
+    let layout = Layout::from_size_align_unchecked(len as usize, CACHE_LINE_LENGTH as usize);
     dealloc(buff_ptr, layout)
 }
 

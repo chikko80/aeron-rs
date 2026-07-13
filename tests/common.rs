@@ -21,6 +21,7 @@ use std::time::Duration;
 pub const TEST_CHANNEL: &str = "aeron:udp?endpoint=localhost:50000";
 pub const TEST_STREAM_ID: i32 = 2000;
 
+#[allow(dead_code)]
 pub fn str_to_c(val: &str) -> CString {
     CString::new(val).expect("Error converting str to CString")
 }
@@ -28,6 +29,7 @@ pub fn str_to_c(val: &str) -> CString {
 // This function starts Aeron media driver. The driver needs to be compiled prior the testing from
 // official C distribution.
 // It should be present in PATH env variable.
+#[allow(dead_code)]
 pub fn start_aeron_md() -> Child {
     let ret = Command::new("aeronmd")
         .env("AERON_DIR_DELETE_ON_SHUTDOWN", "1")
@@ -41,6 +43,27 @@ pub fn start_aeron_md() -> Child {
     ret
 }
 
+#[allow(dead_code)]
+pub fn start_aeron_md_env(envs: &[(&str, &str)]) -> Child {
+    let mut command = Command::new("aeronmd");
+
+    command
+        .env("AERON_DIR_DELETE_ON_SHUTDOWN", "1")
+        .env("AERON_DIR_DELETE_ON_START", "1");
+
+    for (key, value) in envs {
+        command.env(key, value);
+    }
+
+    let ret = command.spawn().expect("aeronmd failed to start");
+
+    // Let some time for driver to start
+    std::thread::sleep(Duration::from_millis(2000));
+
+    ret
+}
+
+#[allow(dead_code)]
 pub fn start_aeron_md_mtu(mtu: &str) -> Child {
     let ret = Command::new("aeronmd")
         .env("AERON_DIR_DELETE_ON_SHUTDOWN", "1")
@@ -56,6 +79,7 @@ pub fn start_aeron_md_mtu(mtu: &str) -> Child {
 }
 
 // Stop the driver at test end
+#[allow(dead_code)]
 pub fn stop_aeron_md(driver_proc: Child) {
     let pid = format!("{}", driver_proc.id()); // get UNIX pid
 

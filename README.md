@@ -32,6 +32,23 @@ Application can use IPC (shared memory) today and could switch to UDP in a matte
 * Can work over UDP which is generally faster than over TCP (as some other messaging systems do)
 * Provides reliable and ordered message flow (even over UPD). Not all fast messaging frameworks guaranty messages order but Aeron do
 
+## Migrating from 0.1.x to 0.2.x
+Since 0.2.0 the receive and send hot paths are lock-free ([#35](https://github.com/UnitedTraders/aeron-rs/issues/35)):
+`Aeron::find_subscription` returns `Arc<Subscription>` and `Aeron::find_publication` returns
+`Arc<Publication>` instead of `Arc<Mutex<...>>`. To migrate, delete the `.lock().unwrap()` at the call
+sites:
+
+```rust
+// 0.1.x
+let fragments_read = subscription.lock().unwrap().poll(&mut handler, 10);
+// 0.2.x
+let fragments_read = subscription.poll(&mut handler, 10);
+```
+
+Note that, as in the Java and C++ Aeron clients, a `Subscription` (and each `Image`) is meant to be
+polled by one thread at a time. Polling concurrently from several threads is memory safe, but fragments
+may be delivered to more than one of the pollers. See CHANGELOG.md for the full list of changes.
+
 ## Running library tests
 Integration tests for *aeron-rs* assume that Media driver executable (aeronmd) is present in the PATH. So prior
 to run these tests install *aeronmd* accordingly.

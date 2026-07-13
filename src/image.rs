@@ -16,7 +16,7 @@
 
 use std::cmp::min;
 use std::ffi::CString;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Arc;
 
 use crate::concurrent::atomic_buffer::AtomicBuffer;
@@ -72,18 +72,23 @@ pub struct Image {
     _exception_handler: Box<dyn ErrorHandler + Send>,
     term_buffers: Vec<AtomicBuffer>,
     subscriber_position: UnsafeBufferPosition,
-    header: Header,
-    is_closed: Arc<AtomicBool>, // to make Image cloneable
-    is_eos: bool,
+    initial_term_id: i32,
+    is_closed: Arc<AtomicBool>, // shared between Image clones so close() is visible to all of them
+    is_eos: Arc<AtomicBool>,
     term_length_mask: Index,
     position_bits_to_shift: i32,
     session_id: i32,
     join_position: i64,
-    final_position: i64,
+    final_position: Arc<AtomicI64>,
     subscription_registration_id: i64,
     correlation_id: i64,
 }
 
+// SAFETY: all mutable state is either atomic (subscriber_position writes go through
+// atomic operations on the shared counters buffer, close state is in Arc<Atomic*>) or
+// immutable after construction. The raw pointers inside AtomicBuffer/UnsafeBufferPosition
+// point into memory-mapped files owned by LogBuffers/driver whose lifetime is tied to the
+// Arc<LogBuffers> held by this Image, so they remain valid on any thread.
 unsafe impl Send for Image {}
 unsafe impl Sync for Image {}
 
@@ -100,11 +105,8 @@ impl Image {
         log_buffers: Arc<LogBuffers>,
         exception_handler: Box<dyn ErrorHandler + Send>,
     ) -> Image {
-        let header = Header::new(
-            log_buffer_descriptor::initial_term_id(
-                &log_buffers.atomic_buffer(log_buffer_descriptor::LOG_META_DATA_SECTION_INDEX),
-            ),
-            log_buffers.atomic_buffer(0).capacity(),
+        let initial_term_id = log_buffer_descriptor::initial_term_id(
+            &log_buffers.atomic_buffer(log_buffer_descriptor::LOG_META_DATA_SECTION_INDEX),
         );
 
         let term_buffers = (0..log_buffer_descriptor::PARTITION_COUNT)
@@ -118,7 +120,7 @@ impl Image {
 
         Self {
             term_buffers,
-            header,
+            initial_term_id,
             subscriber_position: subscriber_position.clone(),
             log_buffers,
             source_identity,
@@ -127,12 +129,19 @@ impl Image {
             correlation_id,
             subscription_registration_id,
             session_id,
-            final_position,
+            final_position: Arc::new(AtomicI64::new(final_position)),
             join_position,
             term_length_mask: capacity - 1,
             position_bits_to_shift: number_of_trailing_zeroes(capacity),
-            is_eos: false,
+            is_eos: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Creates a new fragment Header for this Image. The Header is a cheap cursor object
+    /// which is re-pointed at every fragment during a poll, so each poll call builds its
+    /// own instance on the stack. This is what keeps the poll family `&self`.
+    fn new_fragment_header(&self) -> Header {
+        Header::new(self.initial_term_id, self.term_length_mask + 1)
     }
 
     fn validate_position(&self, new_position: i64) -> Result<(), AeronError> {
@@ -220,7 +229,7 @@ impl Image {
      * @return the initial term id.
      */
     pub fn initial_term_id(&self) -> i32 {
-        self.header.initial_term_id()
+        self.initial_term_id
     }
 
     /**
@@ -248,7 +257,7 @@ impl Image {
      */
     pub fn position(&self) -> i64 {
         if self.is_closed() {
-            return self.final_position;
+            return self.final_position.load(Ordering::Acquire);
         }
 
         self.subscriber_position.get()
@@ -284,7 +293,7 @@ impl Image {
      */
     pub fn is_end_of_stream(&self) -> bool {
         if self.is_closed() {
-            return self.is_eos;
+            return self.is_eos.load(Ordering::Acquire);
         }
 
         self.subscriber_position.get()
@@ -299,22 +308,27 @@ impl Image {
      * Poll for new messages in a stream. If new messages are found beyond the last consumed position then they
      * will be delivered via the fragment_handler_t up to a limited number of fragments as specified.
      *
+     * <b>Note:</b> as in the C++ and Java clients an Image is meant to be polled by one thread at a time.
+     * Polling from several threads concurrently is memory safe (the position is maintained atomically) but
+     * fragments may then be delivered to more than one of the pollers.
+     *
      * @param fragmentHandler to which messages are delivered.
      * @param fragment_limit   for the number of fragments to be consumed during one polling operation.
      * @return the number of fragments that have been consumed.
      *
      * @see fragment_handler_t
      */
-    pub fn poll(&mut self, fragment_handler: &mut impl FnMut(&AtomicBuffer, Index, Index, &Header), fragment_limit: i32) -> i32 {
+    pub fn poll(&self, fragment_handler: &mut impl FnMut(&AtomicBuffer, Index, Index, &Header), fragment_limit: i32) -> i32 {
         if !self.is_closed() {
             let position = self.subscriber_position.get();
             let term_offset: Index = (position as Index) & self.term_length_mask;
             let index = log_buffer_descriptor::index_by_position(position, self.position_bits_to_shift);
             assert!((0..log_buffer_descriptor::PARTITION_COUNT).contains(&index));
             let term_buffer = self.term_buffers[index as usize];
+            let mut header = self.new_fragment_header();
 
             let read_outcome: ReadOutcome =
-                term_reader::read(term_buffer, term_offset, fragment_handler, fragment_limit, &mut self.header);
+                term_reader::read(term_buffer, term_offset, fragment_handler, fragment_limit, &mut header);
 
             if read_outcome.fragments_read > 0 {
                 log!(trace, "Image {} poll returned: {:?}", self.correlation_id, read_outcome);
@@ -344,7 +358,7 @@ impl Image {
      * @see fragment_handler_t
      */
     pub fn bounded_poll(
-        &mut self,
+        &self,
         mut fragment_handler: impl FnMut(&AtomicBuffer, Index, Index, &Header),
         limit_position: i64,
         fragment_limit: i32,
@@ -361,7 +375,8 @@ impl Image {
             let capacity = term_buffer.capacity() as i64;
             let limit_offset = std::cmp::min(capacity, limit_position - initial_position + offset as i64) as i32;
 
-            self.header.set_buffer(term_buffer);
+            let mut header = self.new_fragment_header();
+            header.set_buffer(term_buffer);
 
             while fragments_read < fragment_limit && offset < limit_offset {
                 let length = frame_descriptor::frame_length_volatile(&term_buffer, offset);
@@ -377,13 +392,13 @@ impl Image {
                     continue;
                 }
 
-                self.header.set_offset(frame_offset);
+                header.set_offset(frame_offset);
 
                 fragment_handler(
                     &term_buffer,
                     frame_offset + data_frame_header::LENGTH,
                     length - data_frame_header::LENGTH,
-                    &self.header,
+                    &header,
                 );
 
                 fragments_read += 1;
@@ -413,7 +428,7 @@ impl Image {
      * @see controlled_poll_fragment_handler_t
      */
     pub fn controlled_poll(
-        &mut self,
+        &self,
         mut fragment_handler: impl FnMut(&AtomicBuffer, Index, Index, &Header) -> Result<ControlledPollAction, AeronError>,
         fragment_limit: i32,
     ) -> i32 {
@@ -429,7 +444,8 @@ impl Image {
             let mut resulting_offset: Index = initial_offset;
             let capacity = term_buffer.capacity();
 
-            self.header.set_buffer(term_buffer);
+            let mut header = self.new_fragment_header();
+            header.set_buffer(term_buffer);
 
             while fragments_read < fragment_limit && resulting_offset < capacity {
                 let length = frame_descriptor::frame_length_volatile(&term_buffer, resulting_offset as Index);
@@ -445,13 +461,13 @@ impl Image {
                     continue;
                 }
 
-                self.header.set_offset(frame_offset);
+                header.set_offset(frame_offset);
 
                 let action = fragment_handler(
                     &term_buffer,
                     frame_offset + data_frame_header::LENGTH,
                     length - data_frame_header::LENGTH,
-                    &self.header,
+                    &header,
                 )
                 .unwrap(); //todo unwrap
 
@@ -500,7 +516,7 @@ impl Image {
      * @see controlled_poll_fragment_handler_t
      */
     pub fn bounded_controlled_poll(
-        &mut self,
+        &self,
         mut fragment_handler: impl FnMut(&AtomicBuffer, Index, Index, &Header) -> Result<ControlledPollAction, AeronError>,
         max_position: i64,
         fragment_limit: i32,
@@ -516,7 +532,8 @@ impl Image {
             let capacity = term_buffer.capacity() as i64;
             let end_offset: Index = min(capacity as i64, (max_position - initial_position) + initial_offset as i64) as Index;
 
-            self.header.set_buffer(term_buffer);
+            let mut header = self.new_fragment_header();
+            header.set_buffer(term_buffer);
 
             while fragments_read < fragment_limit && resulting_offset < end_offset {
                 let length = frame_descriptor::frame_length_volatile(&term_buffer, resulting_offset) as Index;
@@ -532,13 +549,13 @@ impl Image {
                     continue;
                 }
 
-                self.header.set_offset(frame_offset);
+                header.set_offset(frame_offset);
 
                 let action = fragment_handler(
                     &term_buffer,
                     frame_offset + data_frame_header::LENGTH,
                     length - data_frame_header::LENGTH,
-                    &self.header,
+                    &header,
                 )
                 .unwrap(); //todo
 
@@ -583,7 +600,7 @@ impl Image {
      * @see controlled_poll_fragment_handler_t
      */
     pub fn controlled_peek(
-        &mut self,
+        &self,
         initial_position: i64,
         mut fragment_handler: impl FnMut(&AtomicBuffer, Index, Index, &Header) -> Result<ControlledPollAction, AeronError>,
         limit_position: i64,
@@ -601,7 +618,8 @@ impl Image {
             let termb_buffer = self.term_buffers[index as usize];
             let capacity: Index = termb_buffer.capacity();
 
-            self.header.set_buffer(termb_buffer); //todo a u sure?
+            let mut header = self.new_fragment_header();
+            header.set_buffer(termb_buffer);
 
             // try
             //     {
@@ -622,13 +640,13 @@ impl Image {
                     continue;
                 }
 
-                self.header.set_offset(frame_offset);
+                header.set_offset(frame_offset);
 
                 let action = fragment_handler(
                     &termb_buffer,
                     frame_offset + data_frame_header::LENGTH,
                     length - data_frame_header::LENGTH,
-                    &self.header,
+                    &header,
                 )
                 .unwrap(); //todo
 
@@ -639,7 +657,7 @@ impl Image {
                 position += (offset - initial_offset) as i64;
                 initial_offset = offset;
 
-                if self.header.flags() & frame_descriptor::END_FRAG != 0 {
+                if header.flags() & frame_descriptor::END_FRAG != 0 {
                     resulting_position = position;
                 }
 
@@ -703,15 +721,23 @@ impl Image {
     }
 
     /// @cond HIDDEN_SYMBOLS
-    pub fn close(&mut self) {
+    ///
+    /// Closing is `&self` because the conductor thread closes Images which a poller may
+    /// still reach through an older list snapshot; the close state is published through
+    /// atomics shared by all clones of this Image.
+    pub fn close(&self) {
         if !self.is_closed() {
-            self.final_position = self.subscriber_position.get_volatile();
-            self.is_eos = self.final_position
-                >= log_buffer_descriptor::end_of_stream_position(
-                    &self
-                        .log_buffers
-                        .atomic_buffer(log_buffer_descriptor::LOG_META_DATA_SECTION_INDEX),
-                );
+            let final_position = self.subscriber_position.get_volatile();
+            self.final_position.store(final_position, Ordering::Release);
+            self.is_eos.store(
+                final_position
+                    >= log_buffer_descriptor::end_of_stream_position(
+                        &self
+                            .log_buffers
+                            .atomic_buffer(log_buffer_descriptor::LOG_META_DATA_SECTION_INDEX),
+                    ),
+                Ordering::Release,
+            );
             self.is_closed.store(true, Ordering::Release)
         }
     }
@@ -1009,7 +1035,7 @@ mod tests {
         );
 
         image_test.subscriber_position.set(initial_position);
-        let mut image = Image::create(
+        let image = Image::create(
             SESSION_ID,
             CORRELATION_ID,
             SUBSCRIPTION_REGISTRATION_ID,
@@ -1051,7 +1077,7 @@ mod tests {
         );
 
         image_test.subscriber_position.set(initial_position);
-        let mut image = Image::create(
+        let image = Image::create(
             SESSION_ID,
             CORRELATION_ID,
             SUBSCRIPTION_REGISTRATION_ID,
@@ -1093,7 +1119,7 @@ mod tests {
         );
 
         image_test.subscriber_position.set(initial_position);
-        let mut image = Image::create(
+        let image = Image::create(
             SESSION_ID,
             CORRELATION_ID,
             SUBSCRIPTION_REGISTRATION_ID,
@@ -1134,7 +1160,7 @@ mod tests {
         );
 
         image_test.subscriber_position.set(initial_position);
-        let mut image = Image::create(
+        let image = Image::create(
             SESSION_ID,
             CORRELATION_ID,
             SUBSCRIPTION_REGISTRATION_ID,
@@ -1165,7 +1191,7 @@ mod tests {
         );
 
         image_test.subscriber_position.set(initial_position);
-        let mut image = Image::create(
+        let image = Image::create(
             SESSION_ID,
             CORRELATION_ID,
             SUBSCRIPTION_REGISTRATION_ID,
@@ -1197,7 +1223,7 @@ mod tests {
         let max_position = initial_position - data_frame_header::LENGTH as i64;
 
         image_test.subscriber_position.set(initial_position);
-        let mut image = Image::create(
+        let image = Image::create(
             SESSION_ID,
             CORRELATION_ID,
             SUBSCRIPTION_REGISTRATION_ID,
@@ -1237,7 +1263,7 @@ mod tests {
         let max_position = initial_position + *ALIGNED_FRAME_LENGTH as i64;
 
         image_test.subscriber_position.set(initial_position);
-        let mut image = Image::create(
+        let image = Image::create(
             SESSION_ID,
             CORRELATION_ID,
             SUBSCRIPTION_REGISTRATION_ID,
@@ -1277,7 +1303,7 @@ mod tests {
         let max_position = initial_position + *ALIGNED_FRAME_LENGTH as i64;
 
         image_test.subscriber_position.set(initial_position);
-        let mut image = Image::create(
+        let image = Image::create(
             SESSION_ID,
             CORRELATION_ID,
             SUBSCRIPTION_REGISTRATION_ID,
@@ -1311,7 +1337,7 @@ mod tests {
         let max_position = initial_position + TERM_LENGTH as i64;
 
         image_test.subscriber_position.set(initial_position);
-        let mut image = Image::create(
+        let image = Image::create(
             SESSION_ID,
             CORRELATION_ID,
             SUBSCRIPTION_REGISTRATION_ID,
@@ -1345,7 +1371,7 @@ mod tests {
         let max_position = i32::MAX as i64 + 1000;
 
         image_test.subscriber_position.set(initial_position);
-        let mut image = Image::create(
+        let image = Image::create(
             SESSION_ID,
             CORRELATION_ID,
             SUBSCRIPTION_REGISTRATION_ID,
@@ -1384,7 +1410,7 @@ mod tests {
         );
 
         image_test.subscriber_position.set(initial_position);
-        let mut image = Image::create(
+        let image = Image::create(
             SESSION_ID,
             CORRELATION_ID,
             SUBSCRIPTION_REGISTRATION_ID,
@@ -1419,7 +1445,7 @@ mod tests {
         );
 
         image_test.subscriber_position.set(initial_position);
-        let mut image = Image::create(
+        let image = Image::create(
             SESSION_ID,
             CORRELATION_ID,
             SUBSCRIPTION_REGISTRATION_ID,
@@ -1460,7 +1486,7 @@ mod tests {
         );
 
         image_test.subscriber_position.set(initial_position);
-        let mut image = Image::create(
+        let image = Image::create(
             SESSION_ID,
             CORRELATION_ID,
             SUBSCRIPTION_REGISTRATION_ID,
@@ -1498,7 +1524,7 @@ mod tests {
         );
 
         image_test.subscriber_position.set(initial_position);
-        let mut image = Image::create(
+        let image = Image::create(
             SESSION_ID,
             CORRELATION_ID,
             SUBSCRIPTION_REGISTRATION_ID,
@@ -1540,7 +1566,7 @@ mod tests {
         );
 
         image_test.subscriber_position.set(initial_position);
-        let mut image = Image::create(
+        let image = Image::create(
             SESSION_ID,
             CORRELATION_ID,
             SUBSCRIPTION_REGISTRATION_ID,
@@ -1582,7 +1608,7 @@ mod tests {
         );
 
         image_test.subscriber_position.set(initial_position);
-        let mut image = Image::create(
+        let image = Image::create(
             SESSION_ID,
             CORRELATION_ID,
             SUBSCRIPTION_REGISTRATION_ID,
@@ -1625,7 +1651,7 @@ mod tests {
         let max_position = initial_position - data_frame_header::LENGTH as i64;
 
         image_test.subscriber_position.set(initial_position);
-        let mut image = Image::create(
+        let image = Image::create(
             SESSION_ID,
             CORRELATION_ID,
             SUBSCRIPTION_REGISTRATION_ID,
@@ -1665,7 +1691,7 @@ mod tests {
         let max_position = initial_position + *ALIGNED_FRAME_LENGTH as i64;
 
         image_test.subscriber_position.set(initial_position);
-        let mut image = Image::create(
+        let image = Image::create(
             SESSION_ID,
             CORRELATION_ID,
             SUBSCRIPTION_REGISTRATION_ID,
@@ -1705,7 +1731,7 @@ mod tests {
         let max_position = initial_position + *ALIGNED_FRAME_LENGTH as i64;
 
         image_test.subscriber_position.set(initial_position);
-        let mut image = Image::create(
+        let image = Image::create(
             SESSION_ID,
             CORRELATION_ID,
             SUBSCRIPTION_REGISTRATION_ID,
@@ -1740,7 +1766,7 @@ mod tests {
         let max_position = initial_position + TERM_LENGTH as i64;
 
         image_test.subscriber_position.set(initial_position);
-        let mut image = Image::create(
+        let image = Image::create(
             SESSION_ID,
             CORRELATION_ID,
             SUBSCRIPTION_REGISTRATION_ID,
@@ -1775,7 +1801,7 @@ mod tests {
         let max_position = i32::MAX as i64 + 1000;
 
         image_test.subscriber_position.set(initial_position);
-        let mut image = Image::create(
+        let image = Image::create(
             SESSION_ID,
             CORRELATION_ID,
             SUBSCRIPTION_REGISTRATION_ID,

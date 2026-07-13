@@ -61,7 +61,7 @@ pub enum RegistrationStatus {
 struct PublicationStateDefn {
     error_message: CString,
     buffers: Option<Arc<LogBuffers>>, // PublicationStateDefn could be created without it
-    publication: Option<Weak<Mutex<Publication>>>, // and then these fields will be set later.
+    publication: Option<Weak<Publication>>, // and then these fields will be set later.
     channel: CString,
     registration_id: i64,
     original_registration_id: i64,
@@ -132,8 +132,8 @@ impl ExclusivePublicationStateDefn {
 
 struct SubscriptionStateDefn {
     error_message: CString,
-    subscription_cache: Option<Arc<Mutex<Subscription>>>,
-    subscription: Option<Weak<Mutex<Subscription>>>,
+    subscription_cache: Option<Arc<Subscription>>,
+    subscription: Option<Weak<Subscription>>,
     on_available_image_handler: Box<dyn OnAvailableImage>,
     on_unavailable_image_handler: Box<dyn OnUnavailableImage>,
     channel: CString,
@@ -594,7 +594,7 @@ impl ClientConductor {
         Ok(registration_id)
     }
 
-    pub fn find_publication(&mut self, registration_id: i64) -> Result<Arc<Mutex<Publication>>, AeronError> {
+    pub fn find_publication(&mut self, registration_id: i64) -> Result<Arc<Publication>, AeronError> {
         /*
         let _guard = self
             .admin_lock
@@ -650,7 +650,7 @@ impl ClientConductor {
                                 buffers.clone(),
                             );
 
-                            let new_pub = Arc::new(Mutex::new(publication));
+                            let new_pub = Arc::new(publication);
                             state.publication = Some(Arc::downgrade(&new_pub));
                             log!(
                                 trace,
@@ -902,7 +902,7 @@ impl ClientConductor {
         Ok(registration_id)
     }
 
-    pub fn find_subscription(&mut self, registration_id: i64) -> Result<Arc<Mutex<Subscription>>, AeronError> {
+    pub fn find_subscription(&mut self, registration_id: i64) -> Result<Arc<Subscription>, AeronError> {
         log!(trace, "find_subscription: with registration_id {}", registration_id);
 
         self.ensure_not_reentrant();
@@ -1331,7 +1331,7 @@ impl ClientConductor {
         for pub_defn in self.publication_by_registration_id.values() {
             if let Some(maybe_publication) = &pub_defn.publication {
                 if let Some(publication) = maybe_publication.upgrade() {
-                    publication.lock().expect("Mutex on pub poisoned").close();
+                    publication.close();
                 }
             }
         }
@@ -1346,14 +1346,14 @@ impl ClientConductor {
         }
         self.exclusive_publication_by_registration_id.clear();
 
-        let mut subscriptions_to_hold_until_cleared: Vec<Arc<Mutex<Subscription>>> = Vec::default();
+        let mut subscriptions_to_hold_until_cleared: Vec<Arc<Subscription>> = Vec::default();
 
         let mut images_to_linger: Vec<Vec<Image>> = Vec::new();
 
         for sub_defn in self.subscription_by_registration_id.values_mut() {
             if let Some(maybe_subscription) = &sub_defn.subscription {
                 if let Some(subscription) = maybe_subscription.upgrade() {
-                    if let Some(mut images) = subscription.lock().expect("Mutex poisoned").close_and_remove_images() {
+                    if let Some(mut images) = subscription.close_and_remove_images() {
                         for image in images.iter_mut() {
                             image.close();
 
@@ -1588,13 +1588,13 @@ impl DriverListener for ClientConductor {
 
             state.status = RegistrationStatus::Registered;
 
-            let subscr = Arc::new(Mutex::new(Subscription::new(
+            let subscr = Arc::new(Subscription::new(
                 self.arced_self.as_ref().unwrap().clone(),
                 state.registration_id,
                 state.channel.clone(),
                 state.stream_id,
                 channel_status_id,
-            )));
+            ));
             state.subscription_cache = Some(subscr.clone());
             state.subscription = Some(Arc::downgrade(&subscr));
 
@@ -1620,8 +1620,7 @@ impl DriverListener for ClientConductor {
 
         for (reg_id, subscr_defn) in &mut self.subscription_by_registration_id {
             if let Some(maybe_subscription) = &subscr_defn.subscription {
-                if let Some(protected_subscription) = maybe_subscription.upgrade() {
-                    let subscription = protected_subscription.lock().expect("Mutex poisoned");
+                if let Some(subscription) = maybe_subscription.upgrade() {
                     if subscription.channel_status_id() == offending_command_correlation_id as i32 {
                         log!(trace, "on_channel_endpoint_error_response: for subscription, offending_command_correlation_id {}, error_message {}", offending_command_correlation_id, error_message.to_str().unwrap());
 
@@ -1658,16 +1657,14 @@ impl DriverListener for ClientConductor {
         for (reg_id, publication_defn) in &self.publication_by_registration_id {
             if let Some(maybe_publication) = &publication_defn.publication {
                 if let Some(publication) = maybe_publication.upgrade() {
-                    if publication.lock().expect("Mutex on pub poisoned").channel_status_id()
-                        == offending_command_correlation_id as i32
-                    {
+                    if publication.channel_status_id() == offending_command_correlation_id as i32 {
                         log!(trace, "on_channel_endpoint_error_response: for publication, offending_command_correlation_id {}, error_message {}", offending_command_correlation_id, error_message.to_str().unwrap());
 
                         self.error_handler.call(ChannelEndpointException(
                             offending_command_correlation_id,
                             String::from(error_message.to_str().expect("CString conversion error")),
                         ));
-                        publication.lock().expect("Mutex on pub poisoned").close();
+                        publication.close();
                         publication_to_remove.push(*reg_id);
                     }
                 }
@@ -1838,7 +1835,7 @@ impl DriverListener for ClientConductor {
                     let _callback_guard = CallbackGuard::new(&mut self.is_in_callback);
                     subscr_defn.on_available_image_handler.call(&image);
 
-                    linger_images = Some(subscription.lock().expect("Mutex poisoned").add_image(image));
+                    linger_images = Some(subscription.add_image(image));
                 }
             }
         }
@@ -1864,9 +1861,7 @@ impl DriverListener for ClientConductor {
             if let Some(maybe_subscription) = &subscr_defn.subscription {
                 if let Some(subscription) = maybe_subscription.upgrade() {
                     // If Image was actually removed
-                    if let Some((old_image_array, index)) =
-                        subscription.lock().expect("Mutex poisoned").remove_image(correlation_id)
-                    {
+                    if let Some((old_image_array, index)) = subscription.remove_image(correlation_id) {
                         let _callback_guard = CallbackGuard::new(&mut self.is_in_callback);
                         subscr_defn
                             .on_unavailable_image_handler
@@ -2251,7 +2246,6 @@ mod tests {
         );
 
         let publication = test.conductor.lock().unwrap().find_publication(id).unwrap();
-        let publication = publication.lock().unwrap();
 
         assert_eq!(publication.registration_id(), id);
         assert_eq!(publication.channel(), str_to_c(CHANNEL));
@@ -2750,9 +2744,7 @@ mod tests {
             .unwrap()
             .on_subscription_ready(id, CHANNEL_STATUS_INDICATOR_ID);
 
-        let result = test.conductor.lock().unwrap().find_subscription(id).expect("Not found");
-
-        let subscription = result.lock().expect("Mutex poisoned");
+        let subscription = test.conductor.lock().unwrap().find_subscription(id).expect("Not found");
 
         assert_eq!(subscription.registration_id(), id);
         assert_eq!(subscription.channel(), str_to_c(CHANNEL));
@@ -3281,7 +3273,7 @@ mod tests {
 
         let subscription = test.conductor.lock().unwrap().find_subscription(id);
         assert!(subscription.is_ok());
-        assert!(subscription.unwrap().lock().unwrap().has_image(correlation_id));
+        assert!(subscription.unwrap().has_image(correlation_id));
 
         let sub_called: bool = ON_NEW_SUB_CALLED2.load(Ordering::SeqCst);
         assert!(sub_called);
@@ -3398,7 +3390,7 @@ mod tests {
 
         let subscription = test.conductor.lock().unwrap().find_subscription(id);
         assert!(subscription.is_ok());
-        assert!(!subscription.unwrap().lock().unwrap().has_image(correlation_id));
+        assert!(!subscription.unwrap().has_image(correlation_id));
 
         let sub_called: bool = ON_NEW_SUB_CALLED4.load(Ordering::SeqCst);
         assert!(sub_called);
@@ -3462,7 +3454,7 @@ mod tests {
             str_to_c(SOURCE_IDENTITY),
         );
         test.conductor.lock().unwrap().on_unavailable_image(correlation_id, id);
-        assert!(!subscription.unwrap().lock().unwrap().has_image(correlation_id));
+        assert!(!subscription.unwrap().has_image(correlation_id));
 
         let sub_called: bool = ON_NEW_SUB_CALLED5.load(Ordering::SeqCst);
         assert!(sub_called);
@@ -3597,7 +3589,7 @@ mod tests {
         let un_img_called: bool = ON_INACTIVE_CALLED7.load(Ordering::SeqCst);
         assert!(!un_img_called);
 
-        assert!(subscription.unwrap().lock().unwrap().has_image(correlation_id));
+        assert!(subscription.unwrap().has_image(correlation_id));
     }
 
     fn on_new_subscription_handler8(channel: CString, stream_id: i32, correlation_id: i64) {
@@ -3657,7 +3649,7 @@ mod tests {
                 str_to_c(&test.log_file_name),
                 str_to_c(SOURCE_IDENTITY),
             );
-            assert!(subscription.unwrap().lock().unwrap().has_image(correlation_id));
+            assert!(subscription.unwrap().has_image(correlation_id));
         }
 
         let sub_called: bool = ON_NEW_SUB_CALLED8.load(Ordering::SeqCst);
@@ -3697,7 +3689,7 @@ mod tests {
             .lock()
             .unwrap()
             .close_all_resources(*test.current_time.lock().unwrap());
-        assert!(publication.unwrap().lock().unwrap().is_closed());
+        assert!(publication.unwrap().is_closed());
     }
 
     #[test]
@@ -3762,7 +3754,7 @@ mod tests {
             .unwrap()
             .close_all_resources(*test.current_time.lock().unwrap());
 
-        assert!(subscription.unwrap().lock().unwrap().is_closed());
+        assert!(subscription.unwrap().is_closed());
     }
 
     #[test]
@@ -3834,11 +3826,9 @@ mod tests {
             .unwrap()
             .close_all_resources(*test.current_time.lock().unwrap());
 
-        let publication = publication.unwrap();
-        let pub_g = publication.lock().unwrap();
+        let pub_g = publication.unwrap();
 
-        let subscription = subscription.unwrap();
-        let sub_g = subscription.lock().unwrap();
+        let sub_g = subscription.unwrap();
 
         let ex_pub = ex_pub.unwrap();
         let ex_pub_g = ex_pub.lock().unwrap();
@@ -3881,7 +3871,7 @@ mod tests {
             str_to_c(SOURCE_IDENTITY),
         );
         {
-            let subscription = sub.lock().unwrap();
+            let subscription = &sub;
             assert!(subscription.has_image(correlation_id));
             // Free mutex
         }
@@ -3890,7 +3880,7 @@ mod tests {
             .unwrap()
             .close_all_resources(*test.current_time.lock().unwrap());
 
-        let subscription = sub.lock().unwrap();
+        let subscription = &sub;
         let image = subscription.image_by_session_id(SESSION_ID);
 
         assert!(subscription.is_closed());

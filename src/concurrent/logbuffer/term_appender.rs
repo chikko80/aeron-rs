@@ -287,7 +287,7 @@ impl TermAppender {
     }
 
     pub fn append_fragmented_message_bulk(
-        &mut self,
+        &self,
         header: &HeaderWriter,
         buffers: Vec<AtomicBuffer>,
         length: Index,

@@ -464,7 +464,7 @@ impl Publication {
      * {@link #ADMIN_ACTION} or {@link #CLOSED}.
      */
     pub fn offer_bulk(
-        &mut self,
+        &self,
         buffers: Vec<AtomicBuffer>,
         reserved_value_supplier: OnReservedValueSupplier,
     ) -> Result<u64, AeronError> {
@@ -477,7 +477,7 @@ impl Publication {
         if !self.is_closed() {
             let limit = self.publication_limit.get_volatile();
             let term_count = log_buffer_descriptor::active_term_count(&self.log_meta_data_buffer);
-            let term_appender = &mut self.appenders[(log_buffer_descriptor::index_by_term_count(term_count as i64)) as usize];
+            let term_appender = &self.appenders[(log_buffer_descriptor::index_by_term_count(term_count as i64)) as usize];
             let raw_tail = term_appender.raw_tail_volatile();
             let term_offset = raw_tail & 0xFFFF_FFFF;
             let term_id = log_buffer_descriptor::term_id(raw_tail);
@@ -545,13 +545,13 @@ impl Publication {
      * @throws IllegalArgumentException if the length is greater than max payload length within an MTU.
      * @see BufferClaim::commit
      */
-    pub fn try_claim(&mut self, length: Index, buffer_claim: &mut BufferClaim) -> Result<u64, AeronError> {
+    pub fn try_claim(&self, length: Index, buffer_claim: &mut BufferClaim) -> Result<u64, AeronError> {
         self.check_payload_length(length)?;
 
         if !self.is_closed() {
             let limit = self.publication_limit.get_volatile();
             let term_count = log_buffer_descriptor::active_term_count(&self.log_meta_data_buffer);
-            let term_appender = &mut self.appenders[log_buffer_descriptor::index_by_term_count(term_count as i64) as usize];
+            let term_appender = &self.appenders[log_buffer_descriptor::index_by_term_count(term_count as i64) as usize];
             let raw_tail = term_appender.raw_tail_volatile();
             let term_offset = raw_tail & 0xFFFF_FFFF;
             let term_id = log_buffer_descriptor::term_id(raw_tail);
@@ -586,7 +586,7 @@ impl Publication {
      * @param endpoint_channel for the destination to add
      * @    correlation id for the add command
      */
-    pub fn add_destination(&mut self, endpoint_channel: CString) -> Result<i64, AeronError> {
+    pub fn add_destination(&self, endpoint_channel: CString) -> Result<i64, AeronError> {
         if self.is_closed() {
             return Err(IllegalStateError::PublicationClosed.into());
         }
@@ -603,7 +603,7 @@ impl Publication {
      * @param endpoint_channel for the destination to remove
      * @    correlation id for the remove command
      */
-    pub fn remove_destination(&mut self, endpoint_channel: CString) -> Result<i64, AeronError> {
+    pub fn remove_destination(&self, endpoint_channel: CString) -> Result<i64, AeronError> {
         if self.is_closed() {
             return Err(IllegalStateError::PublicationClosed.into());
         }
@@ -633,7 +633,7 @@ impl Publication {
      * or Publication::remove_destination
      * @    true for added or false if not.
      */
-    pub fn find_destination_response(&mut self, correlation_id: i64) -> Result<bool, AeronError> {
+    pub fn find_destination_response(&self, correlation_id: i64) -> Result<bool, AeronError> {
         self.conductor
             .lock()
             .expect("Mutex poisoned")
@@ -1008,7 +1008,7 @@ mod tests {
 
     #[test]
     fn should_ensure_the_publication_is_open_before_claim() {
-        let mut test = PublicationTest::new();
+        let test = PublicationTest::new();
         let mut buffer_claim = BufferClaim::default();
 
         test.publication.close();
@@ -1110,7 +1110,7 @@ mod tests {
 
     #[test]
     fn should_rotate_when_claim_trips() {
-        let mut test = PublicationTest::new();
+        let test = PublicationTest::new();
         let active_index = log_buffer_descriptor::index_by_term(TERM_ID_1, TERM_ID_1);
         let initial_position = TERM_MIN_LENGTH - LENGTH;
 

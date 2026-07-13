@@ -221,7 +221,7 @@ impl Aeron {
      * @param registration_id of the Publication returned by Aeron::add_publication
      * @return Publication associated with the registration_id
      */
-    pub fn find_publication(&mut self, registration_id: i64) -> Result<Arc<Mutex<Publication>>, AeronError> {
+    pub fn find_publication(&mut self, registration_id: i64) -> Result<Arc<Publication>, AeronError> {
         self.conductor
             .lock()
             .expect("Mutex poisoned")
@@ -329,7 +329,7 @@ impl Aeron {
      * @param registration_id of the Subscription returned by Aeron::add_subscription
      * @return Subscription associated with the registration_id
      */
-    pub fn find_subscription(&mut self, registration_id: i64) -> Result<Arc<Mutex<Subscription>>, AeronError> {
+    pub fn find_subscription(&mut self, registration_id: i64) -> Result<Arc<Subscription>, AeronError> {
         self.conductor
             .lock()
             .expect("Mutex poisoned")

@@ -127,7 +127,7 @@ fn main() {
         std::thread::yield_now();
     };
 
-    let channel_status = publication.lock().unwrap().channel_status();
+    let channel_status = publication.channel_status();
 
     println!(
         "Publication channel status {}: {} ",
@@ -151,13 +151,13 @@ fn main() {
         println!("offering {}/{}", i + 1, settings.number_of_messages);
         stdout().flush().ok();
 
-        let result = publication.lock().unwrap().offer_part(src_buffer, 0, c_str_msg.len() as i32);
+        let result = publication.offer_part(src_buffer, 0, c_str_msg.len() as i32);
         match result {
             Ok(code) => println!("Sent with code {}!", code),
             Err(err) => println!("Offer with error: {}", err),
         }
 
-        if !publication.lock().unwrap().is_connected() {
+        if !publication.is_connected() {
             println!("No active subscribers detected");
         }
 

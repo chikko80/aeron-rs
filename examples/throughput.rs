@@ -216,7 +216,7 @@ fn main() {
             let mut fragment_handler = fragment_assembler.handler();
 
             while RUNNING.load(Ordering::SeqCst) {
-                let fragments_read = subscription.lock().unwrap().poll(&mut fragment_handler, fragment_count_limit);
+                let fragments_read = subscription.poll(&mut fragment_handler, fragment_count_limit);
 
                 poll_idle_strategy.idle_opt(fragments_read);
             }
@@ -240,11 +240,7 @@ fn main() {
 
             offer_idle_strategy.reset();
 
-            while let Err(AeronError::BackPressured) = publication
-                .lock()
-                .unwrap()
-                .try_claim(settings.message_length, &mut buffer_claim)
-            {
+            while let Err(AeronError::BackPressured) = publication.try_claim(settings.message_length, &mut buffer_claim) {
                 back_pressure_count += 1;
                 offer_idle_strategy.idle();
             }

@@ -84,8 +84,8 @@ struct CmdOpts {
 
 fn send_ping_and_receive_pong(
     mut fragment_handler: impl FnMut(&AtomicBuffer, Index, Index, &Header),
-    publication: Arc<Mutex<Publication>>,
-    subscription: Arc<Mutex<Subscription>>,
+    publication: Arc<Publication>,
+    subscription: Arc<Subscription>,
     settings: &CmdOpts,
 ) {
     let buffer = AlignedBuffer::with_capacity(settings.message_length);
@@ -100,11 +100,7 @@ fn send_ping_and_receive_pong(
                 let slice = ::std::slice::from_raw_parts(&mut start as *mut Instant as *mut u8, std::mem::size_of_val(&start));
                 src_buffer.put_bytes(0, slice);
             }
-            let position = publication
-                .lock()
-                .unwrap()
-                .offer_part(src_buffer, 0, settings.message_length)
-                .unwrap();
+            let position = publication.offer_part(src_buffer, 0, settings.message_length).unwrap();
 
             if position > 0 {
                 break position;
@@ -112,11 +108,10 @@ fn send_ping_and_receive_pong(
         };
 
         // Wait for image
-        while subscription.lock().unwrap().image_by_index(0).is_none() {
+        while subscription.image_by_index(0).is_none() {
             std::thread::sleep(Duration::from_millis(1000));
         }
 
-        let subscription = subscription.lock().unwrap(); // Lock subscription. Means that it can't be changed by incoming messages (e.g. new images)
         let image = subscription.image_by_index(0).unwrap();
 
         idle_strategy.reset();

@@ -80,7 +80,7 @@ fn test_publication_create() {
     }
 
     // At this point publication must be created and be available for publishing
-    assert_eq!(publication.unwrap().lock().unwrap().channel_status(), CHANNEL_ENDPOINT_ACTIVE);
+    assert_eq!(publication.unwrap().channel_status(), CHANNEL_ENDPOINT_ACTIVE);
 
     common::stop_aeron_md(md);
 }
@@ -114,10 +114,7 @@ fn test_subscription_create() {
     }
 
     // At this point publication must be created and be available for publishing
-    assert_eq!(
-        subscription.unwrap().lock().unwrap().channel_status(),
-        CHANNEL_ENDPOINT_ACTIVE
-    );
+    assert_eq!(subscription.unwrap().channel_status(), CHANNEL_ENDPOINT_ACTIVE);
 
     common::stop_aeron_md(md);
 }
@@ -178,8 +175,8 @@ fn test_unfragmented_msg() {
     let publication = publication.unwrap();
 
     // At this point publication must be created and be available for publishing
-    assert_eq!(subscription.lock().unwrap().channel_status(), CHANNEL_ENDPOINT_ACTIVE);
-    assert_eq!(publication.lock().unwrap().channel_status(), CHANNEL_ENDPOINT_ACTIVE);
+    assert_eq!(subscription.channel_status(), CHANNEL_ENDPOINT_ACTIVE);
+    assert_eq!(publication.channel_status(), CHANNEL_ENDPOINT_ACTIVE);
 
     let buffer = AlignedBuffer::with_capacity(256);
     let src_buffer = AtomicBuffer::from_aligned(&buffer);
@@ -189,7 +186,7 @@ fn test_unfragmented_msg() {
         src_buffer.put::<u8>(i, i as u8);
     }
 
-    let result = publication.lock().unwrap().offer(src_buffer);
+    let result = publication.offer(src_buffer);
 
     if let Ok(code) = result {
         println!("Sent with code {}!", code);
@@ -200,7 +197,7 @@ fn test_unfragmented_msg() {
     let idle_strategy = SleepingIdleStrategy::new(1000);
 
     for _i in 0..3 {
-        let fragments_read = subscription.lock().expect("Fu").poll(&mut on_new_fragment_check_payload, 10);
+        let fragments_read = subscription.poll(&mut on_new_fragment_check_payload, 10);
         if fragments_read > 0 {
             break;
         }
@@ -259,8 +256,8 @@ fn test_fragmented_msg() {
     let publication = publication.unwrap();
 
     // At this point publication must be created and be available for publishing
-    assert_eq!(subscription.lock().unwrap().channel_status(), CHANNEL_ENDPOINT_ACTIVE);
-    assert_eq!(publication.lock().unwrap().channel_status(), CHANNEL_ENDPOINT_ACTIVE);
+    assert_eq!(subscription.channel_status(), CHANNEL_ENDPOINT_ACTIVE);
+    assert_eq!(publication.channel_status(), CHANNEL_ENDPOINT_ACTIVE);
 
     let buffer = AlignedBuffer::with_capacity(256);
     let src_buffer = AtomicBuffer::from_aligned(&buffer);
@@ -270,7 +267,7 @@ fn test_fragmented_msg() {
         src_buffer.put::<u8>(i, i as u8);
     }
 
-    let result = publication.lock().unwrap().offer(src_buffer);
+    let result = publication.offer(src_buffer);
 
     if let Ok(code) = result {
         println!("Sent with code {}!", code);
@@ -297,7 +294,7 @@ fn test_fragmented_msg() {
     let handler = &mut fragment_assembler.handler();
 
     for _i in 0..3 {
-        let fragments_read = subscription.lock().expect("Fu").poll(handler, 10);
+        let fragments_read = subscription.poll(handler, 10);
         idle_strategy.idle_opt(fragments_read);
     }
 
@@ -373,15 +370,15 @@ fn test_sequential_consistency() {
     let publication = publication.unwrap();
 
     // At this point publication must be created and be available for publishing
-    assert_eq!(subscription.lock().unwrap().channel_status(), CHANNEL_ENDPOINT_ACTIVE);
-    assert_eq!(publication.lock().unwrap().channel_status(), CHANNEL_ENDPOINT_ACTIVE);
+    assert_eq!(subscription.channel_status(), CHANNEL_ENDPOINT_ACTIVE);
+    assert_eq!(publication.channel_status(), CHANNEL_ENDPOINT_ACTIVE);
 
     let subscriber_thread = thread::Builder::new()
         .name(String::from("Subscriber thread"))
         .spawn(move || {
             let poll_idle_strategy = BusySpinIdleStrategy::default();
             for _messages_received in 0..messages_to_send {
-                let fragments_read = subscription.lock().unwrap().poll(&mut on_new_fragment_check_seq_no, 100);
+                let fragments_read = subscription.poll(&mut on_new_fragment_check_seq_no, 100);
 
                 poll_idle_strategy.idle_opt(fragments_read);
             }
@@ -394,7 +391,7 @@ fn test_sequential_consistency() {
     for seq_no in 0..messages_to_send {
         offer_idle_strategy.reset();
 
-        while publication.lock().unwrap().try_claim(I64_SIZE, &mut buffer_claim).is_err() {
+        while publication.try_claim(I64_SIZE, &mut buffer_claim).is_err() {
             offer_idle_strategy.idle();
         }
 

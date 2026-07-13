@@ -146,7 +146,7 @@ fn main() {
         std::thread::yield_now();
     };
 
-    let channel_status = subscription.lock().expect("Fu").channel_status();
+    let channel_status = subscription.channel_status();
 
     println!(
         "Subscription channel status {}: {}",
@@ -157,7 +157,7 @@ fn main() {
     let idle_strategy = SleepingIdleStrategy::new(1000);
 
     while RUNNING.load(Ordering::SeqCst) {
-        let fragments_read = subscription.lock().expect("Fu").poll(&mut on_new_fragment, 10);
+        let fragments_read = subscription.poll(&mut on_new_fragment, 10);
         idle_strategy.idle_opt(fragments_read);
     }
 }

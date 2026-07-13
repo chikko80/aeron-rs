@@ -60,7 +60,7 @@ pub enum RegistrationStatus {
 
 struct PublicationStateDefn {
     error_message: CString,
-    buffers: Option<Arc<LogBuffers>>, // PublicationStateDefn could be created without it
+    buffers: Option<Arc<LogBuffers>>,       // PublicationStateDefn could be created without it
     publication: Option<Weak<Publication>>, // and then these fields will be set later.
     channel: CString,
     registration_id: i64,

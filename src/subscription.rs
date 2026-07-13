@@ -15,12 +15,13 @@
  */
 
 use std::ffi::CString;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+
+use arc_swap::ArcSwap;
 
 use crate::client_conductor::ClientConductor;
 use crate::concurrent::atomic_buffer::AtomicBuffer;
-use crate::concurrent::atomic_vec::AtomicVec;
 use crate::concurrent::logbuffer::header::Header;
 use crate::concurrent::logbuffer::term_scan::BlockHandler;
 use crate::concurrent::status::status_indicator_reader;
@@ -32,12 +33,19 @@ pub struct Subscription {
     conductor: Arc<Mutex<ClientConductor>>,
     channel: CString,
     channel_status_id: i32,
-    round_robin_index: Index,
+    round_robin_index: AtomicUsize,
     //todo std::size_t
     registration_id: i64,
     stream_id: i32,
 
-    image_list: AtomicVec<Image>,
+    /// Copy-on-write snapshot of the Images attached to this Subscription, following the
+    /// C++ client model (std::atomic<std::shared_ptr<std::vector<Image>>>). The poll path
+    /// loads the snapshot wait-free; the guard keeps an old snapshot alive if the client
+    /// conductor swaps a new one in mid-poll.
+    image_list: ArcSwap<Vec<Image>>,
+    /// Serializes image-list writers. In practice all writers run on the single client
+    /// conductor thread, so this lock is uncontended; the poll path never touches it.
+    image_list_writer_lock: Mutex<()>,
     is_closed: AtomicBool,
 }
 
@@ -53,10 +61,11 @@ impl Subscription {
             conductor,
             channel,
             channel_status_id,
-            round_robin_index: 0,
+            round_robin_index: AtomicUsize::new(0),
             registration_id,
             stream_id,
-            image_list: AtomicVec::new(),
+            image_list: ArcSwap::from_pointee(vec![]),
+            image_list_writer_lock: Mutex::new(()),
             is_closed: AtomicBool::from(false),
         }
     }
@@ -161,33 +170,29 @@ impl Subscription {
             .count() as _
     }
 
-    fn poll_inner(&mut self, fragment_limit: i32, mut poll_kind: impl FnMut(&mut Image, i32) -> i32) -> i32 {
-        let image_list = self.image_list.load_mut();
+    fn poll_inner(&self, fragment_limit: i32, mut poll_kind: impl FnMut(&Image, i32) -> i32) -> i32 {
+        let image_list = self.image_list.load();
+        let length = image_list.len();
 
-        let mut starting_index = self.round_robin_index as usize;
-        self.round_robin_index += 1;
+        let mut starting_index = self.round_robin_index.load(Ordering::Relaxed);
 
-        if starting_index >= image_list.len() {
-            self.round_robin_index = 0;
+        if starting_index >= length {
             starting_index = 0;
+            self.round_robin_index.store(0, Ordering::Relaxed);
+        } else {
+            self.round_robin_index.store(starting_index + 1, Ordering::Relaxed);
         }
 
         let mut fragments_read = 0;
-        for i in starting_index..image_list.len() {
+        for i in starting_index..length {
             if fragments_read < fragment_limit {
-                fragments_read += poll_kind(
-                    image_list.get_mut(i).expect("Error getting element from Image vec"),
-                    fragment_limit - fragments_read,
-                );
+                fragments_read += poll_kind(&image_list[i], fragment_limit - fragments_read);
             }
         }
 
         for i in 0..starting_index {
             if fragments_read < fragment_limit {
-                fragments_read += poll_kind(
-                    image_list.get_mut(i).expect("Error getting element from Image vec"),
-                    fragment_limit - fragments_read,
-                );
+                fragments_read += poll_kind(&image_list[i], fragment_limit - fragments_read);
             }
         }
 
@@ -199,6 +204,11 @@ impl Subscription {
      * <p>
      * Each fragment read will be a whole message if it is under MTU length. If larger than MTU then it will come
      * as a series of fragments ordered withing a session.
+     * <p>
+     * This method is lock-free: the client conductor may add and remove {@link Image}s concurrently with the
+     * poll without blocking it. As in the C++ and Java clients a Subscription is meant to be polled by one
+     * thread at a time; polling from several threads concurrently is memory safe but fragments may then be
+     * delivered to more than one of the pollers.
      *
      * @param fragment_handler callback for handling each message fragment as it is read.
      * @param fragment_limit   number of message fragments to limit for the poll across multiple Image s.
@@ -206,7 +216,7 @@ impl Subscription {
      *
      * @see fragment_handler_t
      */
-    pub fn poll(&mut self, fragment_handler: &mut impl FnMut(&AtomicBuffer, Index, Index, &Header), fragment_limit: i32) -> i32 {
+    pub fn poll(&self, fragment_handler: &mut impl FnMut(&AtomicBuffer, Index, Index, &Header), fragment_limit: i32) -> i32 {
         self.poll_inner(fragment_limit, |image, fragments_left| {
             image.poll(fragment_handler, fragments_left)
         })
@@ -228,7 +238,7 @@ impl Subscription {
      * @see controlled_poll_fragment_handler_t
      */
     pub fn controlled_poll(
-        &mut self,
+        &self,
         mut fragment_handler: impl FnMut(&AtomicBuffer, Index, Index, &Header) -> Result<ControlledPollAction, AeronError>,
         fragment_limit: i32,
     ) -> i32 {
@@ -244,12 +254,12 @@ impl Subscription {
      * @param block_length_limit for each individual block.
      * @return the number of bytes consumed.
      */
-    pub fn block_poll(&mut self, block_handler: BlockHandler, block_length_limit: i32) -> i64 {
+    pub fn block_poll(&self, block_handler: BlockHandler, block_length_limit: i32) -> i64 {
         let image_list = self.image_list.load();
 
         let mut bytes_consumed: i64 = 0;
 
-        for image in image_list {
+        for image in image_list.iter() {
             bytes_consumed += image.block_poll(block_handler, block_length_limit) as i64;
         }
 
@@ -262,11 +272,7 @@ impl Subscription {
      * @return true if the subscription has more than one open image available.
      */
     pub fn is_connected(&self) -> bool {
-        let image_list = self.image_list.load();
-
-        let length = image_list.len();
-
-        (0..length).any(|idx| !image_list.get(idx).expect("Error getting element from Image vec").is_closed())
+        self.image_list.load().iter().any(|image| !image.is_closed())
     }
 
     /**
@@ -275,44 +281,49 @@ impl Subscription {
      * @return count of images associated with this subscription.
      */
     pub fn image_count(&self) -> usize {
-        let image_list = self.image_list.load();
-        image_list.len()
+        self.image_list.load().len()
     }
 
     /**
      * Return the {@link Image} associated with the given session_id.
      *
-     * This method generates a new copy of the Image overlaying the logbuffer.
+     * This method returns a copy of the Image overlaying the logbuffer.
      * It is up to the application to not use the Image if it becomes unavailable.
      *
      * @param session_id associated with the Image.
-     * @return Image associated with the given session_id or nullptr if no Image exist.
+     * @return Image associated with the given session_id or None if no Image exists.
      */
-    pub fn image_by_session_id(&self, session_id: i32) -> Option<&Image> {
-        let list = self.image_list.load();
-        list.iter().find(|img| img.session_id() == session_id)
+    pub fn image_by_session_id(&self, session_id: i32) -> Option<Image> {
+        self.image_list
+            .load()
+            .iter()
+            .find(|img| img.session_id() == session_id)
+            .cloned()
     }
 
     /**
      * Get the image at the given index from the images array.
      *
-     * This is only valid until the image list changes.
+     * This method returns a copy of the Image overlaying the logbuffer.
+     * It is up to the application to not use the Image if it becomes unavailable.
      *
      * @param index in the array
-     * @return image at given index or exception if out of range.
+     * @return image at given index or None if out of range.
      */
-    pub fn image_by_index(&mut self, index: usize) -> Option<&mut Image> {
-        let list = self.image_list.load_mut();
-        list.get_mut(index)
+    pub fn image_by_index(&self, index: usize) -> Option<Image> {
+        self.image_list.load().get(index).cloned()
     }
 
     /**
-     * Get a std::vector of active {@link Image}s that match this subscription.
+     * Get a snapshot of the active {@link Image}s that match this subscription.
      *
-     * @return a std::vector of active {@link Image}s that match this subscription.
+     * The returned snapshot is immutable: Images added or removed afterwards do not
+     * show up in it.
+     *
+     * @return a snapshot of active {@link Image}s that match this subscription.
      */
-    pub fn images(&self) -> &Vec<Image> {
-        self.image_list.load()
+    pub fn images(&self) -> Arc<Vec<Image>> {
+        self.image_list.load_full()
     }
 
     /**
@@ -325,36 +336,65 @@ impl Subscription {
     }
 
     pub fn has_image(&self, correlation_id: i64) -> bool {
-        let list = self.image_list.load();
-        list.iter().any(|img| img.correlation_id() == correlation_id)
+        self.image_list
+            .load()
+            .iter()
+            .any(|img| img.correlation_id() == correlation_id)
     }
 
     /// Adds image to the subscription and returns Images
-    /// as they were just before adding this Image
-    pub fn add_image(&mut self, image: Image) -> Vec<Image> {
-        self.image_list.add(image)
+    /// as they were just before adding this Image.
+    ///
+    /// Meant to be called from the client conductor thread only.
+    pub fn add_image(&self, image: Image) -> Vec<Image> {
+        let _guard = self.image_list_writer_lock.lock().expect("Mutex poisoned");
+
+        let old_image_list = self.image_list.load_full();
+        let mut new_image_list = (*old_image_list).clone();
+        new_image_list.push(image);
+        self.image_list.store(Arc::new(new_image_list));
+
+        Arc::try_unwrap(old_image_list).unwrap_or_else(|images| (*images).clone())
     }
 
     /// Removes image with given correlation_id and returns old Images (as of before removal)
     /// and index of removed element.
     /// Returns None if Image was not removed (e.g. was not found).
-    pub fn remove_image(&mut self, correlation_id: i64) -> Option<(Vec<Image>, Index)> {
-        self.image_list.remove(|image| {
+    ///
+    /// Meant to be called from the client conductor thread only.
+    pub fn remove_image(&self, correlation_id: i64) -> Option<(Vec<Image>, Index)> {
+        let _guard = self.image_list_writer_lock.lock().expect("Mutex poisoned");
+
+        let old_image_list = self.image_list.load_full();
+
+        let index = old_image_list.iter().position(|image| {
             if image.correlation_id() == correlation_id {
+                // The close state is shared between Image clones, therefore pollers
+                // still holding this Image in an older snapshot observe the close too.
                 image.close();
                 true
             } else {
                 false
             }
-        })
+        })?;
+
+        let mut new_image_list = (*old_image_list).clone();
+        new_image_list.remove(index);
+        self.image_list.store(Arc::new(new_image_list));
+
+        let old_images = Arc::try_unwrap(old_image_list).unwrap_or_else(|images| (*images).clone());
+        Some((old_images, index as Index))
     }
 
     /// Removes all images and returns old Images if subscription is not closed.
     /// Returns None if subscription is closed.
-    pub fn close_and_remove_images(&mut self) -> Option<Vec<Image>> {
+    ///
+    /// Meant to be called from the client conductor thread only.
+    pub fn close_and_remove_images(&self) -> Option<Vec<Image>> {
         if !self.is_closed.swap(true, Ordering::SeqCst) {
-            let images = self.image_list.take();
-            Some(images)
+            let _guard = self.image_list_writer_lock.lock().expect("Mutex poisoned");
+            let old_image_list = self.image_list.swap(Arc::new(vec![]));
+            Some(Arc::try_unwrap(old_image_list).unwrap_or_else(|images| (*images).clone()))
         } else {
             None
         }
@@ -363,7 +403,8 @@ impl Subscription {
 
 impl Drop for Subscription {
     fn drop(&mut self) {
-        let list = self.image_list.take();
+        let old_image_list = self.image_list.swap(Arc::new(vec![]));
+        let list = Arc::try_unwrap(old_image_list).unwrap_or_else(|images| (*images).clone());
 
         self.conductor
             .lock()

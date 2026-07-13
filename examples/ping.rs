@@ -116,7 +116,7 @@ fn send_ping_and_receive_pong(
             std::thread::sleep(Duration::from_millis(1000));
         }
 
-        let mut subscription = subscription.lock().unwrap(); // Lock subscription. Means that it can't be changed by incoming messages (e.g. new images)
+        let subscription = subscription.lock().unwrap(); // Lock subscription. Means that it can't be changed by incoming messages (e.g. new images)
         let image = subscription.image_by_index(0).unwrap();
 
         idle_strategy.reset();

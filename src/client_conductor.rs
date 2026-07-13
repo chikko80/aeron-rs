@@ -1621,7 +1621,7 @@ impl DriverListener for ClientConductor {
         for (reg_id, subscr_defn) in &mut self.subscription_by_registration_id {
             if let Some(maybe_subscription) = &subscr_defn.subscription {
                 if let Some(protected_subscription) = maybe_subscription.upgrade() {
-                    let mut subscription = protected_subscription.lock().expect("Mutex poisoned");
+                    let subscription = protected_subscription.lock().expect("Mutex poisoned");
                     if subscription.channel_status_id() == offending_command_correlation_id as i32 {
                         log!(trace, "on_channel_endpoint_error_response: for subscription, offending_command_correlation_id {}, error_message {}", offending_command_correlation_id, error_message.to_str().unwrap());
 
